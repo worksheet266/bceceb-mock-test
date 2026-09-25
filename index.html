@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>BCECEB Assistant Manager — Mock Test Portal</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.12.5/firebase-app-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.12.5/firebase-firestore-compat.js"></script>
 <style>
 :root{
   --navy:#0b2545; --navy2:#13315c; --blue:#1e5fa8; --lblue:#e7f0fb; --lblue2:#cfe3fa;
@@ -125,8 +127,20 @@ textarea.imp{width:100%;min-height:110px;font-family:monospace;font-size:12px;pa
 
 <div id="toast" class="toast"></div>
 
+<!-- ============ LOADING / CONFIG SCREEN ============ -->
+<div id="loadingScreen" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:linear-gradient(160deg,#0b2545,#13315c);color:#fff;text-align:center;font-size:14px">
+  <div id="loadingMsg">Connecting to database…</div>
+</div>
+<div id="configErrorScreen" class="hidden" style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:#e7f0fb">
+  <div style="background:#fff;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.15);max-width:520px;padding:28px" >
+    <h2 style="color:#b3261e;margin-top:0">Firebase not configured</h2>
+    <p style="font-size:13.5px;line-height:1.6">This portal now needs a free Firebase project so candidate accounts, questions and results sync across every device. Open <code>index.html</code>, find the <code>firebaseConfig</code> object near the top of the <code>&lt;script&gt;</code>, and paste in your own project's keys (see the setup guide provided with this file). Until that's filled in, the portal can only run in single-device demo mode.</p>
+    <button class="btn btn-primary" style="max-width:220px" onclick="runOffline()">Continue in demo mode (this device only)</button>
+  </div>
+</div>
+
 <!-- ============ LOGIN ============ -->
-<div id="loginScreen">
+<div id="loginScreen" class="hidden">
   <div class="login-card">
     <h1>BCECEB Assistant Manager</h1>
     <p class="sub">Mock Test Portal &middot; Practice Platform (Demo)</p>
@@ -193,8 +207,21 @@ textarea.imp{width:100%;min-height:110px;font-family:monospace;font-size:12px;pa
 
 <script>
 /* =========================================================
-   BCECEB MOCK TEST PORTAL — standalone localStorage prototype
+   BCECEB MOCK TEST PORTAL — Firebase Firestore backend
+   (shared, real-time data across every device; falls back to
+   single-device localStorage "demo mode" if not configured)
    ========================================================= */
+
+/* >>> PASTE YOUR OWN FIREBASE PROJECT CONFIG HERE (see setup guide) <<< */
+const firebaseConfig = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_PROJECT.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT.appspot.com",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID"
+};
+
 const LS = {
   users:'bceceb_users', questions:'bceceb_questions', attempts:'bceceb_attempts',
   activity:'bceceb_activity', settings:'bceceb_settings'
@@ -203,15 +230,42 @@ const SECTIONS = {A:{name:'General Studies + Mental Ability',count:30,target:'26
                    B:{name:'Language + Management',count:40,target:'35-36'},
                    C:{name:'Economy + Agriculture',count:30,target:'26-27'}};
 
-function loadLS(k,def){ try{const v=localStorage.getItem(k); return v?JSON.parse(v):def;}catch(e){return def;} }
-function saveLS(k,v){ localStorage.setItem(k, JSON.stringify(v)); }
+let db = null;            // Firestore handle, null = offline/demo mode
+let fbReady = false;
+const CACHE = {};         // in-memory mirror of every LS key, kept live by onSnapshot
+
+/* loadLS/saveLS keep the exact same signatures the rest of the app already
+   uses, so nothing else in the codebase needs to change. */
+function loadLS(k,def){ return (k in CACHE) ? CACHE[k] : def; }
+function saveLS(k,v){
+  CACHE[k]=v;
+  if(!fbReady) { try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){} return; }
+  if(k===LS.attempts || k===LS.activity) replaceCollection(k, v);
+  else db.collection('meta').doc(k).set({value:v}).catch(e=>toast('Sync error: '+e.message,'err'));
+}
+/* additive, race-safe write for a single new attempt / activity entry */
+function remoteAdd(key, item){
+  CACHE[key] = (CACHE[key]||[]).concat([item]);
+  if(fbReady) db.collection(key).doc(item.id).set(item).catch(e=>toast('Sync error: '+e.message,'err'));
+  else try{ localStorage.setItem(key, JSON.stringify(CACHE[key])); }catch(e){}
+}
+async function replaceCollection(key, arr){
+  if(!fbReady) return;
+  const col = db.collection(key);
+  const snap = await col.get();
+  const batch = db.batch();
+  snap.docs.forEach(d=>batch.delete(d.ref));
+  arr.forEach(item=> batch.set(col.doc(item.id||uid('doc')), item));
+  await batch.commit().catch(e=>toast('Sync error: '+e.message,'err'));
+}
+
 function uid(p){ return p+'_'+Math.random().toString(36).slice(2,9); }
 function hash(s){ let h=0; for(let i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))>>>0;} return 'h'+h; } // demo-only obfuscation, not real security
 function toast(msg,type){ const t=document.createElement('div'); t.className='toast-item '+(type||''); t.textContent=msg;
   document.getElementById('toast').appendChild(t); setTimeout(()=>t.remove(),3500); }
 function fmtDate(ts){ return new Date(ts).toLocaleString(); }
 
-/* ---------- seed demo data ---------- */
+/* ---------- sample question generator ---------- */
 function genQuestions(){
   const qs=[];
   const pack = {
@@ -234,34 +288,73 @@ function genQuestions(){
   });
   return qs;
 }
-function seedIfEmpty(){
-  if(!localStorage.getItem(LS.users)){
-    const users=[
-      {id:'admin',username:'Admin',passHash:hash('Admin@9304'),role:'admin',name:'Administrator',active:true},
-    ];
-    saveLS(LS.users,users);
-  }
-  if(!localStorage.getItem(LS.questions)) saveLS(LS.questions, genQuestions());
-  if(!localStorage.getItem(LS.attempts)) saveLS(LS.attempts, []);
-  if(!localStorage.getItem(LS.activity)) saveLS(LS.activity, []);
-  if(!localStorage.getItem(LS.settings)) saveLS(LS.settings, {durationMin:90, negativeMarking:false, showReview:true, warnThreshold:5});
-}
-seedIfEmpty();
+function defaultAdmin(){ return [{id:'admin',username:'Admin',passHash:hash('Admin@9304'),role:'admin',name:'Administrator',active:true}]; }
+function defaultSettings(){ return {durationMin:90, negativeMarking:false, showReview:true, warnThreshold:5}; }
 
-/* One-time migration: browsers that already loaded an earlier version of this
-   portal have the old demo admin login ("admin" / "admin123") saved in
-   localStorage, so the new default never gets seeded. Upgrade it automatically,
-   but only if the admin account still has those original demo credentials
-   (so a password already changed by the real Admin is never touched). */
-function migrateLegacyAdmin(){
-  const users = loadLS(LS.users,[]);
-  const admin = users.find(u=>u.role==='admin');
+/* ---------- startup: connect to Firebase, seed if first run, subscribe live ---------- */
+async function initApp(){
+  const configured = firebaseConfig.apiKey && !firebaseConfig.apiKey.startsWith('PASTE_');
+  if(!configured){ runOffline(); return; }
+  try{
+    firebase.initializeApp(firebaseConfig);
+    db = firebase.firestore();
+    fbReady = true;
+    const usersDoc = await db.collection('meta').doc(LS.users).get();
+    if(!usersDoc.exists){
+      await db.collection('meta').doc(LS.users).set({value:defaultAdmin()});
+      await db.collection('meta').doc(LS.questions).set({value:genQuestions()});
+      await db.collection('meta').doc(LS.settings).set({value:defaultSettings()});
+    } else {
+      migrateLegacyAdminRemote(usersDoc.data().value);
+    }
+    subscribeLive();
+    document.getElementById('loadingScreen').classList.add('hidden');
+    document.getElementById('loginScreen').classList.remove('hidden');
+  }catch(e){
+    document.getElementById('loadingMsg').textContent = 'Could not connect: '+e.message;
+    document.getElementById('loadingScreen').classList.add('hidden');
+    document.getElementById('configErrorScreen').classList.remove('hidden');
+  }
+}
+function subscribeLive(){
+  db.collection('meta').doc(LS.users).onSnapshot(d=>{ CACHE[LS.users]=d.exists?d.data().value:defaultAdmin(); liveRefresh(); });
+  db.collection('meta').doc(LS.questions).onSnapshot(d=>{ CACHE[LS.questions]=d.exists?d.data().value:[]; liveRefresh(); });
+  db.collection('meta').doc(LS.settings).onSnapshot(d=>{ CACHE[LS.settings]=d.exists?d.data().value:defaultSettings(); });
+  db.collection(LS.attempts).onSnapshot(s=>{ CACHE[LS.attempts]=s.docs.map(x=>x.data()); liveRefresh(); });
+  db.collection(LS.activity).onSnapshot(s=>{ CACHE[LS.activity]=s.docs.map(x=>x.data()); liveRefresh(); });
+}
+/* if a screen is open, re-render it so other people's changes appear without a manual refresh */
+function liveRefresh(){
+  if(session && document.getElementById('app').style.display!=='none'){
+    try{ navigate(session.role==='admin'?'adminHome':'candHome'); }catch(e){}
+  }
+}
+/* Single-device fallback: behaves exactly like the earlier localStorage-only build. */
+function runOffline(){
+  document.getElementById('loadingScreen').classList.add('hidden');
+  document.getElementById('configErrorScreen').classList.add('hidden');
+  fbReady = false;
+  Object.values(LS).forEach(k=>{
+    try{ const v = localStorage.getItem(k); if(v) CACHE[k]=JSON.parse(v); }catch(e){}
+  });
+  if(!(LS.users in CACHE)) saveLS(LS.users, defaultAdmin());
+  if(!(LS.questions in CACHE)) saveLS(LS.questions, genQuestions());
+  if(!(LS.attempts in CACHE)) saveLS(LS.attempts, []);
+  if(!(LS.activity in CACHE)) saveLS(LS.activity, []);
+  if(!(LS.settings in CACHE)) saveLS(LS.settings, defaultSettings());
+  migrateLegacyAdminRemote(CACHE[LS.users]);
+  document.getElementById('loginScreen').classList.remove('hidden');
+}
+/* One-time migration: upgrade the old demo admin login ("admin"/"admin123")
+   automatically, but only if it still has those original demo credentials. */
+function migrateLegacyAdminRemote(users){
+  const admin = (users||[]).find(u=>u.role==='admin');
   if(admin && admin.username.toLowerCase()==='admin' && admin.passHash===hash('admin123')){
     admin.username='Admin'; admin.passHash=hash('Admin@9304');
     saveLS(LS.users, users);
   }
 }
-migrateLegacyAdmin();
+initApp();
 
 /* ---------- state ---------- */
 let session = null; // {userId, role}
@@ -531,10 +624,9 @@ function submitTest(auto){
     answers: t.answers,
     questionsSnapshot: t.questions.map((q,i)=>({q:q.q,options:q.options,correct:q.correct,given:t.answers[i],explanation:q.explanation,section:q.section}))
   };
-  const attempts = loadLS(LS.attempts,[]); attempts.push(attempt); saveLS(LS.attempts,attempts);
-  const acts = loadLS(LS.activity,[]);
-  t.activityLog.forEach(a=> acts.push({...a, userId:t.userId, attemptId:t.id}));
-  saveLS(LS.activity, acts);
+  remoteAdd(LS.attempts, attempt);
+  const actEntries = t.activityLog.map(a=>({...a, id:uid('act'), userId:t.userId, attemptId:t.id}));
+  actEntries.forEach(e=> remoteAdd(LS.activity, e));
 
   document.getElementById('testScreen').style.display='none';
   document.getElementById('app').style.display='block';
@@ -861,7 +953,7 @@ function renderAdminBackup(){
   <textarea class="imp" id="restoreArea" placeholder="Paste backup JSON here, or choose a file below"></textarea>
   <div style="margin-top:8px"><input type="file" id="backupFile" accept=".json" onchange="loadBackupFile(this.files[0])"></div>
   <button class="btn-sm btn-danger" style="margin-top:10px" onclick="restoreBackup()">Restore (overwrites current data)</button></div>
-  <div class="panel"><h3>Sample / Demo Data</h3><p style="font-size:12.5px;color:var(--muted)">This installation was preloaded with 4 demo candidates, 1 admin account, 100 sample (placeholder) MCQs and sample results for demonstrating the analytics dashboard.</p>
+  <div class="panel"><h3>Sample / Demo Data</h3><p style="font-size:12.5px;color:var(--muted)">This installation's Question Bank was preloaded with 100 sample (placeholder) MCQs for testing the timer and test flow. No demo candidates are preloaded — all candidate logins are created by the Admin under "Candidates".</p>
   <button class="btn-sm btn-danger" onclick="clearSampleData()">Delete Sample Attempts</button></div>`;
 }
 function exportBackup(){
